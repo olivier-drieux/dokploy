@@ -2,6 +2,7 @@ import { restoreWebServerBackup } from "@dokploy/server/utils/restore/web-server
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const execAsync = vi.hoisted(() => vi.fn());
+const migrateRestoredLegacyTwoFactorSecrets = vi.hoisted(() => vi.fn());
 
 vi.mock("node:fs/promises", async (importOriginal) => ({
 	...(await importOriginal<typeof import("node:fs/promises")>()),
@@ -15,6 +16,9 @@ vi.mock("@dokploy/server/utils/backups/utils", () => ({
 	getS3Credentials: () => [],
 }));
 vi.mock("@dokploy/server/utils/process/execAsync", () => ({ execAsync }));
+vi.mock("@dokploy/server/utils/restore/legacy-two-factor", () => ({
+	migrateRestoredLegacyTwoFactorSecrets,
+}));
 
 const destination = { bucket: "test-bucket" } as Parameters<
 	typeof restoreWebServerBackup
@@ -23,6 +27,8 @@ const destination = { bucket: "test-bucket" } as Parameters<
 describe("web server restore migrations", () => {
 	beforeEach(() => {
 		execAsync.mockReset();
+		migrateRestoredLegacyTwoFactorSecrets.mockReset();
+		migrateRestoredLegacyTwoFactorSecrets.mockResolvedValue(0);
 		execAsync.mockImplementation(async (command: string) => {
 			if (command.includes("ls /tmp/dokploy-restore-test/database.sql.gz")) {
 				return { stdout: "", stderr: "" };
@@ -77,6 +83,35 @@ describe("web server restore migrations", () => {
 				logs.push(log),
 			),
 		).rejects.toThrow("Migration failed");
+		expect(logs).not.toContain("Restore completed successfully!");
+	});
+
+	it("migrates restored 2FA data after schema migrations", async () => {
+		const logs: string[] = [];
+		await restoreWebServerBackup(destination, "webserver-backup.zip", (log) =>
+			logs.push(log),
+		);
+
+		const schemaIndex = logs.indexOf("Running database migrations...");
+		const twoFactorIndex = logs.indexOf("Migrating restored 2FA secrets...");
+		const successIndex = logs.indexOf("Restore completed successfully!");
+		expect(schemaIndex).toBeGreaterThanOrEqual(0);
+		expect(twoFactorIndex).toBeGreaterThan(schemaIndex);
+		expect(successIndex).toBeGreaterThan(twoFactorIndex);
+		expect(migrateRestoredLegacyTwoFactorSecrets).toHaveBeenCalledOnce();
+	});
+
+	it("does not report success when restored 2FA cannot be decrypted", async () => {
+		migrateRestoredLegacyTwoFactorSecrets.mockRejectedValue(
+			new Error("Unknown auth secret"),
+		);
+		const logs: string[] = [];
+
+		await expect(
+			restoreWebServerBackup(destination, "webserver-backup.zip", (log) =>
+				logs.push(log),
+			),
+		).rejects.toThrow("Unknown auth secret");
 		expect(logs).not.toContain("Restore completed successfully!");
 	});
 });
